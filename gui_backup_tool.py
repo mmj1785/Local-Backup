@@ -435,18 +435,7 @@ def _decode_bytes(b: bytes) -> str:
     return b.decode("utf-8", errors="replace")
 
 
-def _get_subprocess_kwargs():
-    """خيارات إخفاء أي شاشة سوداء للأوامر المنفذة في ويندوز تماماً"""
-    kwargs = {}
-    if sys.platform == "win32":
-        kwargs["creationflags"] = (
-            subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
-        )
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0  # SW_HIDE
-        kwargs["startupinfo"] = si
-    return kwargs
+_get_subprocess_kwargs = core._get_subprocess_kwargs  # نفس دالة إخفاء النوافذ في backup_tool
 
 
 def net_use_connect(ip, username, password, timeout=20):
@@ -623,13 +612,17 @@ class ShareDiscoveryWorker(QThread):
 
 
 class BackupWorker(QThread):
-    progress   = pyqtSignal(str, int)
+    progress   = pyqtSignal(str, int)   # (اسم المصدر، النسبة الكلية 0-99)
     status_msg = pyqtSignal(str)
-    finished   = pyqtSignal(bool)
+    error_msg  = pyqtSignal(str)        # سبب الفشل/الرفض ليُعرض للمستخدم
+    done       = pyqtSignal(bool)       # (لا نسمّيها finished حتى لا نحجب إشارة QThread)
 
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.cfg = cfg
+
+    def cancel(self):
+        core.request_cancel()
 
     def run(self):
         logger = logging.getLogger("backup_tool_gui")
@@ -650,31 +643,41 @@ class BackupWorker(QThread):
         except Exception:
             pass
 
+        names = [s["name"] for s in self.cfg["sources"]]
+        total = max(1, len(names))
         last_update = [0.0, -2]
 
         def cb(name, pct, fname=""):
-            # Robocopy قد يبلغ عن آلاف الملفات في الثانية. تقييد التحديثات هنا
-            # يبقي الواجهة ناعمة بدون إبطاء النسخ الفعلي.
+            # التقدم الكلي = (المصادر المنتهية + نسبة الحالي) / عدد المصادر.
+            # تقييد التحديثات يبقي الواجهة ناعمة بدون إبطاء النسخ الفعلي.
+            idx = names.index(name) if name in names else 0
+            frac = 1.0 if pct == -1 else max(0, min(100, pct)) / 100
+            overall = min(99, int((idx + frac) / total * 100))
             now = time.monotonic()
-            should_emit = pct in (-1, 100) or (now - last_update[0] >= 0.15 and pct != last_update[1])
+            should_emit = pct in (-1, 100) or (now - last_update[0] >= 0.15 and overall != last_update[1])
             if not should_emit:
                 return
-            last_update[:] = [now, pct]
-            self.progress.emit(name, pct)
+            last_update[:] = [now, overall]
+            self.progress.emit(name, overall)
+            tag = f"({idx + 1}/{total})"
             if pct == -1:
-                self.status_msg.emit(f"⚙ جاري التحقق: {name}")
+                self.status_msg.emit(f"⚙ جاري التحقق {tag}: {name}")
             elif fname:
-                self.status_msg.emit(f"📋 نسخ: {name} → {fname}")
+                self.status_msg.emit(f"📋 نسخ {tag}: {name} → {fname}")
             else:
-                self.status_msg.emit(f"📋 نسخ: {name}  ({pct}%)")
+                self.status_msg.emit(f"📋 نسخ {tag}: {name}  ({pct}%)")
 
         try:
             ok, _, _ = core.run_backup(self.cfg, logger, False, cb)
-            self.finished.emit(ok)
+            self.done.emit(ok)
+        except ValueError as e:               # إعدادات غير سليمة (تداخل مسارات...)
+            logger.error("إعدادات غير صالحة:\n%s", e)
+            self.error_msg.emit(str(e))
+            self.done.emit(False)
         except Exception as e:
-            self.status_msg.emit(f"خطأ: {e}")
-            self.finished.emit(False)
-
+            logger.exception("خطأ غير متوقع")
+            self.error_msg.emit(f"خطأ غير متوقع: {e}")
+            self.done.emit(False)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Modern Progress Bar
@@ -758,7 +761,8 @@ class ResultCard(QFrame):
 # Main Window
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_ROBOCOPY = {"retries": 3, "wait_seconds": 5, "threads": 8,
-                    "mirror": False, "backup_mode": False}
+                    "mirror": False, "backup_mode": False,
+                    "overwrite_existing": False}   # الوضع الآمن: لا يُستبدل أي ملف بالوجهة
 DEFAULT_JOB = {"job_retries": 3, "job_retry_wait_seconds": 60, "retention_days": 30}
 
 COL_NAME = 0
@@ -1133,6 +1137,11 @@ class BackupMainWindow(QMainWindow):
                                     "font-size: 11pt; border-radius: 9px; padding: 0 16px;")
         self.btn_run.clicked.connect(self._start_backup)
         run_btn_row.addWidget(self.btn_run)
+        self.btn_cancel = ModernButton("إيقاف", "■", "ghost")
+        self.btn_cancel.setFixedSize(130, 42)
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.clicked.connect(self._cancel_backup)
+        run_btn_row.addWidget(self.btn_cancel)
         run_btn_row.addStretch()
         run_lay.addLayout(run_btn_row)
 
@@ -1179,6 +1188,8 @@ class BackupMainWindow(QMainWindow):
     # Navigation
     # ─────────────────────────────────────────────────────────────────────────
     PAGE_TITLES = ["الاتصال بالسيرفر", "إدارة المسارات", "التشغيل والمتابعة"]
+    _cancel_requested = False
+    _last_error = ""
 
     def _switch_page(self, idx: int):
         for i, btn in enumerate(self._nav_btns):
@@ -1301,6 +1312,12 @@ class BackupMainWindow(QMainWindow):
             QMessageBox.warning(self, "تنبيه",
                                 "أدخل الاسم + المصدر + الوجهة قبل الإضافة.")
             return
+        try:  # امنع التداخل من لحظة الإضافة
+            core.validate_config({"sources": self._get_sources() +
+                                  [{"name": name, "path": src, "destination": dst}]})
+        except ValueError as ex:
+            QMessageBox.warning(self, "تداخل أو خطأ في المسارات", str(ex))
+            return
         item = QTreeWidgetItem([name, src, dst])
         item.setToolTip(COL_SRC, src)
         item.setToolTip(COL_DST, dst)
@@ -1333,7 +1350,7 @@ class BackupMainWindow(QMainWindow):
             raise ValueError("أضف مصدراً واحداً على الأقل.")
         return {
             "sources": sources,
-            "target_root": sources[0]["destination"],
+            "target_root": "",  # لكل صف وجهته الصريحة
             "timestamped_backup": False,
             "robocopy": DEFAULT_ROBOCOPY,
             **DEFAULT_JOB,
@@ -1364,10 +1381,13 @@ class BackupMainWindow(QMainWindow):
         try:
             cfg = yaml.safe_load(open(path, encoding="utf-8"))
             self.src_tree.clear()
+            root = str(cfg.get("target_root") or "").strip()
             for s in cfg.get("sources", []):
+                dst = s.get("destination") or ""
+                if not dst and root:  # ملف إعدادات قديم/CLI: وجهة = الجذر + اسم المجلد
+                    dst = os.path.join(root, os.path.basename(os.path.normpath(s.get("path", ""))) or s.get("name", ""))
                 self.src_tree.addTopLevelItem(
-                    QTreeWidgetItem([s.get("name",""), s.get("path",""),
-                                     s.get("destination","")]))
+                    QTreeWidgetItem([s.get("name",""), s.get("path",""), dst]))
             conn = cfg.get("connection", {})
             if conn.get("ip"): self.entry_ip.setText(conn["ip"])
             if conn.get("username"): self.entry_user.setText(conn["username"])
@@ -1384,14 +1404,18 @@ class BackupMainWindow(QMainWindow):
             return
         try:
             cfg = self._build_config()
+            core.validate_config(cfg)   # يمنع التداخل قبل أي كتابة على القرص
         except ValueError as ex:
-            QMessageBox.warning(self, "تنبيه", str(ex)); return
+            QMessageBox.critical(self, "لا يمكن بدء النسخ", str(ex)); return
 
+        self._cancel_requested = False
+        self._last_error = ""
         self.result_card.clear()
         self.progress_bar.setValue(0)
         self.lbl_pct.setText("0%")
         self.lbl_prog_src.setText("جاري البدء...")
         self.btn_run.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
         self._run_start = time.time()
         self._elapsed_timer.start()
 
@@ -1402,8 +1426,24 @@ class BackupMainWindow(QMainWindow):
         self.worker.progress.connect(self._on_progress)
         self.worker.status_msg.connect(
             lambda m: self.lbl_prog_src.setText(m))
-        self.worker.finished.connect(self._on_finished)
+        self.worker.error_msg.connect(self._on_error)
+        self.worker.done.connect(self._on_finished)
         self.worker.start()
+
+    def _cancel_backup(self):
+        if not (self.worker and self.worker.isRunning()):
+            return
+        if QMessageBox.question(
+                self, "إيقاف النسخ",
+                "إيقاف النسخ الجاري الآن؟\nالملفات التي نُسخت بالفعل تبقى في الوجهة، "
+                "ويمكنك إعادة التشغيل لاحقاً لإكمال الباقي.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        self._cancel_requested = True
+        self.btn_cancel.setEnabled(False)
+        self.lbl_prog_src.setText("⏹ جاري الإيقاف...")
+        self.worker.cancel()
 
     def _tick_elapsed(self):
         e = int(time.time() - self._run_start)
@@ -1419,10 +1459,19 @@ class BackupMainWindow(QMainWindow):
         else:
             self.lbl_prog_src.setText(f"⚙ تحقق من: {name}")
 
+    def _on_error(self, msg: str):
+        self._last_error = msg
+
     def _on_finished(self, ok: bool):
         self._elapsed_timer.stop()
         self._time_badge.setText("")
         self.btn_run.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        if self._cancel_requested:
+            self.lbl_prog_src.setText("⏹ أُلغيت العملية بطلبك")
+            self.lbl_pct.setText(f"{self.progress_bar.value()}%")
+            self.result_card.clear()
+            return
         self.progress_bar.setValue(100 if ok else self.progress_bar.value())
         self.lbl_pct.setText("100%" if ok else f"{self.progress_bar.value()}%")
         self.lbl_prog_src.setText("اكتملت العملية" if ok else "انتهت بفشل")
@@ -1430,16 +1479,27 @@ class BackupMainWindow(QMainWindow):
             self.result_card.show_ok()
         else:
             self.result_card.show_fail()
+            if self._last_error:   # أظهر السبب بدل ضياعه خلف عبارة "انتهت بفشل"
+                QMessageBox.critical(self, "فشلت العملية", self._last_error)
+                self._last_error = ""
 
     def closeEvent(self, event):
-        """لا تسمح بإغلاق Qt بينما خيط النسخ ما زال يكتب على القرص."""
+        """أثناء النسخ: اسأل المستخدم، وعند الموافقة أوقف النسخ بأمان ثم أغلق."""
         if self.worker and self.worker.isRunning():
-            QMessageBox.warning(
-                self, "نسخ جارٍ", "لا يمكن إغلاق التطبيق أثناء النسخ الاحتياطي. انتظر حتى تظهر النتيجة.")
-            event.ignore()
-            return
+            if QMessageBox.question(
+                    self, "نسخ جارٍ",
+                    "يوجد نسخ جارٍ. إيقافه والخروج الآن؟",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._cancel_requested = True
+            self.worker.cancel()
+            if not self.worker.wait(20000):
+                event.ignore()
+                QMessageBox.warning(self, "تنبيه", "لم يتوقف النسخ بعد، حاول الإغلاق بعد قليل.")
+                return
         super().closeEvent(event)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point

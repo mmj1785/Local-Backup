@@ -1,19 +1,27 @@
 # مثال إعدادات (نفس الصيغة التي تحفظها الواجهة وتقرأها أداة CLI)
 sources:
+  # لكل مصدر وجهته الصريحة (destination) - يُمنع تداخل الوجهات أو داخل المصادر
   - name: Documents
     path: D:\Documents
+    destination: \\server\backup\Documents
   - name: JadeDB
     path: D:\Jade\DB
-target_root: \\server\backup
+    destination: E:\Backups\JadeDB
+  # بدون destination: يُستخدم target_root + مجلد باسم المصدر
+  - name: Photos
+    path: D:\Photos
+target_root: \\server\backup\Default
 timestamped_backup: true
 robocopy:
   retries: 5
   wait_seconds: 15
   threads: 4
-  mirror: false
+  mirror: false              # ممنوع تفعيله (يحذف من الوجهة) - يرفضه البرنامج
+  overwrite_existing: false  # false = لا يُستبدل أي ملف موجود بالوجهة، يُنسخ الجديد فقط
   backup_mode: false
 job_retries: 3
 job_retry_wait_seconds: 60
+retention_enabled: false   # لا حذف تلقائي أبداً إلا لو فُعّل صراحةً (مع timestamped_backup)
 retention_days: 30
 verification:
   compare_file_count_and_size: true

@@ -1,0 +1,964 @@
+diff --git a/backup_tool.py b/backup_tool.py
+index 4e2520f..af0d251 100644
+--- a/backup_tool.py
++++ b/backup_tool.py
+@@ -1,9 +1,11 @@
+ 
+ import argparse
++from collections import deque
+ import hashlib
+ import logging
+ import logging.handlers
+ import os
++import re
+ import shutil
+ import smtplib
+ import subprocess
+@@ -87,6 +89,47 @@ def _get_subprocess_kwargs():
+     return kwargs
+ 
+ 
++# أعلام robocopy الممنوعة نهائياً: تنقل/تحذف من المصدر أو تحذف من الوجهة
++_FORBIDDEN_FLAGS = {"/MOV", "/MOVE", "/PURGE", "/MIR"}
++
++
++def _assert_safe_args(args):
++    """حماية أخيرة: لا يُسمح أبداً بتنفيذ أمر يمكنه حذف أو نقل ملفات."""
++    bad = [a for a in args[3:] if a.upper().split(":")[0] in _FORBIDDEN_FLAGS]
++    if bad:
++        raise RuntimeError(f"أعلام robocopy ممنوعة لحماية الملفات: {bad}")
++
++
++# سطر ملف منسوخ في مخرجات robocopy مع /BYTES:  "New File   1234   path"
++_COPIED_LINE = re.compile(r"^\s*(New File|Newer|Older|Changed|Modified)\s+(\d+)\s+(.+?)\s*$")
++
++# إلغاء العملية من الواجهة (أو من أي خيط آخر)
++CANCEL = threading.Event()
++_active_proc = [None]
++
++
++def request_cancel():
++    """يطلب إيقاف النسخ الجاري: يوقف robocopy فوراً ولا يبدأ مصادر جديدة."""
++    CANCEL.set()
++    proc = _active_proc[0]
++    if proc is not None and proc.poll() is None:
++        try:
++            proc.terminate()
++        except OSError:
++            pass
++
++
++def _decode_console(raw: bytes) -> str:
++    """robocopy يكتب عبر الأنبوب بترميز OEM الخاص بويندوز (وليس UTF-8)،
++    فنفكّه بنفس الترميز حتى تظهر أسماء الملفات العربية سليمة."""
++    if sys.platform == "win32":
++        try:
++            return raw.decode("oem", errors="replace")
++        except LookupError:
++            pass
++    return raw.decode("utf-8", errors="replace")
++
++
+ def run_robocopy(src: str, dst: str, cfg: dict, logger: logging.Logger, dry_run: bool,
+                  progress_callback=None) -> bool:
+     """ينفذ Robocopy بسرعة عالية وبدون أي شاشات سوداء."""
+@@ -121,8 +164,11 @@ def run_robocopy(src: str, dst: str, cfg: dict, logger: logging.Logger, dry_run:
+         # نافذة مخفية يزيد الحمل بلا فائدة.
+     ]
+ 
+-    if rc_cfg.get("mirror"):
+-        args.append("/MIR")
++    # الافتراضي: لا يُستبدل أي ملف موجود في الوجهة (يُنسخ الجديد فقط):
++    #   /XC تخطي المتغيّر  /XN تخطي الأحدث بالمصدر  /XO تخطي الأقدم بالمصدر
++    overwrite = bool(rc_cfg.get("overwrite_existing", False))
++    if not overwrite:
++        args += ["/XC", "/XN", "/XO"]
+ 
+     if rc_cfg.get("backup_mode"):
+         args.append("/ZB")
+@@ -133,12 +179,22 @@ def run_robocopy(src: str, dst: str, cfg: dict, logger: logging.Logger, dry_run:
+         args.append("/L")
+         logger.info("[DRY-RUN] لن يتم نسخ أي ملف فعلياً")
+ 
++    _assert_safe_args(args)
+     logger.info(f"تنفيذ: {' '.join(args)}")
+ 
++    if CANCEL.is_set():
++        return False
++
++    # الحجم الكلي للمصدر مرة واحدة (لحساب نسبة تقدم حقيقية بالبايت)
++    total_size = 0
++    if progress_callback and not dry_run:
++        _, total_size = folder_stats(src)
++
+     sp_kwargs = _get_subprocess_kwargs()
+     try:
+         proc = subprocess.Popen(
+             args,
++            stdin=subprocess.DEVNULL,
+             stdout=subprocess.PIPE,
+             stderr=subprocess.STDOUT,
+             **sp_kwargs
+@@ -150,35 +206,63 @@ def run_robocopy(src: str, dst: str, cfg: dict, logger: logging.Logger, dry_run:
+         logger.error("تعذر بدء Robocopy: %s", exc)
+         return False
+ 
+-    file_count = 0
++    _active_proc[0] = proc
++    copied = 0
++    kept_different = 0  # ملفات موجودة بالوجهة بنسخة مختلفة ولم تُستبدل
++    tail = deque(maxlen=60)  # آخر الأسطر فقط (الملخص) حتى لا يتضخم اللوج
++    report = progress_callback is not None and not dry_run
+ 
+-    if progress_callback and not dry_run:
+-        progress_callback(5)
++    if report:
++        progress_callback(0)
+ 
+-    # قراءة مخرجات Robocopy في الوقت الفعلي بدون أي استهلاك للموارد
+     try:
+         for raw in iter(proc.stdout.readline, b""):
+-            line = raw.decode("utf-8", errors="replace").strip()
++            line = _decode_console(raw).strip()
+             if not line:
+                 continue
+-            # عند نسخ ملف جديد أو معدل يظهره Robocopy
+-            if any(marker in line for marker in ("New File", "Newer", "Older", "Changed", "*EXTRA")):
+-                file_count += 1
+-                parts = line.split()
+-                fname = parts[-1] if parts else line
+-                # اسم الملف فقط للاختصار
+-                short_name = os.path.basename(fname)
+-                if progress_callback:
+-                    # تحديث نسبي سلس
+-                    pct = min(95, 10 + (file_count * 3))
+-                    progress_callback(pct, short_name)
++            tail.append(line)
++            if CANCEL.is_set():
++                break
++            m = _COPIED_LINE.match(line)
++            if m:
++                label = m.group(1)
++                if label != "New File" and not overwrite:
++                    kept_different += 1   # تم تخطيه (موجود بالوجهة) وليس منسوخاً
++                    continue
++                if report:
++                    copied += int(m.group(2))
++                    pct = min(99, int(copied * 100 / total_size)) if total_size > 0 else 0
++                    progress_callback(pct, re.split(r"[\\/]", m.group(3))[-1])
+     except Exception as exc:
+         logger.warning("تعذر قراءة تقدم Robocopy: %s", exc)
+ 
+-    proc.wait()
+-    exit_code = proc.returncode
++    cancelled = CANCEL.is_set()
++    if cancelled and proc.poll() is None:
++        try:
++            proc.terminate()
++        except OSError:
++            pass
++    try:
++        proc.wait(timeout=15 if cancelled else None)
++    except subprocess.TimeoutExpired:
++        proc.kill()
++        proc.wait()
++    finally:
++        _active_proc[0] = None
++
++    if tail:
++        logger.debug("\n".join(tail))
++
++    if cancelled:
++        logger.warning("تم إيقاف Robocopy بطلب المستخدم.")
++        return False
+ 
+-    if progress_callback and not dry_run:
++    if kept_different:
++        logger.warning(f"{kept_different} ملف موجود بالوجهة بنسخة مختلفة عن المصدر لم يُستبدل "
++                       f"(الوضع الآمن: لا يُستبدل أي ملف موجود).")
++
++    exit_code = proc.returncode
++    if report:
+         progress_callback(100, "اكتمل")
+ 
+     # Robocopy: الأكواد 0-7 نجاح (0: متطابق مسبقاً، 1: تم نسخ ملفات، 2: ملفات إضافية، 3: 1+2)
+@@ -202,13 +286,16 @@ def backup_source_with_retry(name: str, src: str, dst: str, cfg: dict, logger: l
+         return False
+ 
+     for attempt in range(1, max_retries + 1):
++        if CANCEL.is_set():
++            return False
+         logger.info(f"[{name}] محاولة {attempt}/{max_retries}: نسخ {src} -> {dst}")
+         ok = run_robocopy(src, dst, cfg, logger, dry_run, progress_callback)
+         if ok:
+             return True
+         if attempt < max_retries:
+             logger.warning(f"[{name}] فشلت المحاولة {attempt}. الانتظار {wait_between} ثانية قبل إعادة المحاولة...")
+-            time.sleep(wait_between)
++            if CANCEL.wait(wait_between):  # انتظار قابل للإلغاء
++                return False
+ 
+     logger.error(f"[{name}] فشلت كل المحاولات ({max_retries}).")
+     return False
+@@ -220,14 +307,21 @@ def backup_source_with_retry(name: str, src: str, dst: str, cfg: dict, logger: l
+ def folder_stats(path: str):
+     """يرجع (عدد الملفات، الحجم الكلي بالبايت) لمجلد."""
+     total_files, total_size = 0, 0
+-    for root, _, files in os.walk(path):
+-        for f in files:
+-            fp = os.path.join(root, f)
+-            try:
+-                total_size += os.path.getsize(fp)
+-                total_files += 1
+-            except OSError:
+-                pass
++    stack = [path]
++    while stack:
++        try:
++            with os.scandir(stack.pop()) as it:
++                for e in it:
++                    try:
++                        if e.is_dir(follow_symlinks=False):
++                            stack.append(e.path)
++                        else:
++                            total_size += e.stat(follow_symlinks=False).st_size
++                            total_files += 1
++                    except OSError:
++                        pass
++        except OSError:
++            pass
+     return total_files, total_size
+ 
+ 
+@@ -249,6 +343,8 @@ def verify_backup(name: str, src: str, dst: str, cfg: dict, logger: logging.Logg
+     all_ok = True
+ 
+     if v_cfg.get("compare_file_count_and_size", True):
++        overwrite_existing = bool(cfg.get("robocopy", {}).get("overwrite_existing", False))
++        kept_old = 0
+         missing_count = 0
+         size_mismatches = 0
+         checked_files = 0
+@@ -276,15 +372,21 @@ def verify_backup(name: str, src: str, dst: str, cfg: dict, logger: logging.Logg
+                 try:
+                     d_stat = os.stat(dst_file)
+                     if s_stat.st_size != d_stat.st_size:
+-                        logger.warning(f"[{name}] اختلاف في الحجم للملف: {rel} (المصدر: {s_stat.st_size} بايت | الهدف: {d_stat.st_size} بايت)")
+-                        size_mismatches += 1
+-                        all_ok = False
++                        if not overwrite_existing:
++                            kept_old += 1
++                            logger.warning(f"[{name}] نسخة مختلفة محفوظة بالوجهة ولم تُستبدل: {rel}")
++                        else:
++                            logger.warning(f"[{name}] اختلاف في الحجم للملف: {rel} (المصدر: {s_stat.st_size} بايت | الهدف: {d_stat.st_size} بايت)")
++                            size_mismatches += 1
++                            all_ok = False
+                 except OSError as e:
+                     logger.warning(f"[{name}] تعذر قراءة بيانات الملف بالهدف {rel}: {e}")
+                     all_ok = False
+ 
+         if all_ok:
+-            logger.info(f"[{name}] تحقق ناجح: جميع ملفات المصدر ({checked_files} ملف، {total_src_size} بايت) موجودة ومتطابقة بالهدف.")
++            logger.info(f"[{name}] تحقق ناجح: جميع ملفات المصدر ({checked_files} ملف، {total_src_size} بايت) موجودة بالهدف.")
++            if kept_old:
++                logger.warning(f"[{name}] تنبيه: {kept_old} ملف بنسخة مختلفة بالوجهة (لم تُستبدل حسب الوضع الآمن).")
+         else:
+             logger.warning(f"[{name}] فشل التحقق: {missing_count} ملف مفقود، {size_mismatches} ملف مختلف الحجم.")
+ 
+@@ -349,53 +451,107 @@ def send_email(subject: str, body: str, cfg: dict, logger: logging.Logger):
+         msg["To"] = ", ".join(e_cfg["to_addrs"])
+         with smtplib.SMTP(e_cfg["smtp_server"], e_cfg["smtp_port"], timeout=30) as server:
+             server.starttls()
+-            server.login(e_cfg["username"], e_cfg["password"])
++            server.login(e_cfg["username"], os.environ.get("BACKUP_SMTP_PASSWORD") or e_cfg.get("password", ""))
+             server.sendmail(e_cfg["from_addr"], e_cfg["to_addrs"], msg.as_string())
+         logger.info("تم إرسال إيميل التنبيه.")
+     except Exception as e:
+         logger.error(f"فشل إرسال الإيميل: {e}")
+ 
+ 
+-def validate_config(cfg: dict) -> None:
+-    """يتحقق من الإعدادات قبل أي كتابة على القرص.
++# ----------------------------------------------------------------------------
++# Jobs planning + validation (منع تداخل المصادر والوجهات)
++# ----------------------------------------------------------------------------
++def _norm(p: str) -> str:
++    return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+ 
+-    أهم قيد هنا هو منع جعل الوجهة داخل المصدر، لأن ذلك قد يحول النسخ إلى حلقة
+-    تتضخم فيها الملفات بلا نهاية.
+-    """
++
++def _is_inside(child: str, parent: str) -> bool:
++    """True لو child مساوٍ لـ parent أو بداخله (بدون حساسية لحالة الأحرف على ويندوز)."""
++    c, p = _norm(child), _norm(parent)
++    return c == p or c.startswith(p.rstrip("\\/") + os.sep)
++
++
++def _overlaps(a: str, b: str) -> bool:
++    return _is_inside(a, b) or _is_inside(b, a)
++
++
++def plan_jobs(cfg: dict, timestamp_folder: str = None):
++    """يحوّل الإعدادات إلى مهام (name, src, dst).
++    - destination صريحة للمصدر: تُستخدم كما هي (تُنسخ محتوياته مباشرة إليها).
++    - وإلا: target_root + مجلد باسم المصدر (مع منع تكرار الأسماء)، وبمجلد التاريخ لو مفعّل."""
++    default_root = str(cfg.get("target_root") or "").strip()
++    stamped = bool(cfg.get("timestamped_backup", False) and timestamp_folder)
++    used_folder_names = {}
++    jobs = []
++    for item in cfg.get("sources") or []:
++        name, src = item.get("name", ""), item.get("path", "")
++        explicit = str(item.get("destination") or "").strip()
++        if explicit:
++            dst = explicit
++        elif default_root:
++            run_root = os.path.join(default_root, timestamp_folder) if stamped else default_root
++            base_folder_name = os.path.basename(os.path.normpath(src)) or name
++            count = used_folder_names.get(base_folder_name, 0)
++            folder_name = base_folder_name if count == 0 else f"{base_folder_name}_{count + 1}"
++            used_folder_names[base_folder_name] = count + 1
++            dst = os.path.join(run_root, folder_name)
++        else:
++            dst = ""
++        jobs.append({"name": name, "src": src, "dst": dst})
++    return jobs
++
++
++def collect_config_errors(cfg: dict):
++    """يرجع قائمة بكل أخطاء الإعدادات (فارغة = سليمة)، قبل أي كتابة على القرص."""
+     sources = cfg.get("sources")
+     if not isinstance(sources, list) or not sources:
+-        raise ValueError("أضف مصدراً واحداً على الأقل قبل بدء النسخ.")
+-    if not str(cfg.get("target_root", "")).strip():
+-        raise ValueError("حدد مجلد النسخ الاحتياطي الرئيسي أولاً.")
++        return ["أضف مصدراً واحداً على الأقل قبل بدء النسخ."]
+ 
+-    seen_names = set()
++    errors, seen = [], set()
++    if (cfg.get("robocopy") or {}).get("mirror"):
++        errors.append("خيار mirror ممنوع: يحذف من الوجهة كل ما ليس في المصدر. "
++                      "هذه الأداة لا تحذف أي ملف من الوجهة أبداً.")
++    default_root = str(cfg.get("target_root") or "").strip()
+     for item in sources:
+         if not isinstance(item, dict):
+-            raise ValueError("صيغة أحد المصادر غير صحيحة.")
++            errors.append("صيغة أحد المصادر غير صحيحة.")
++            continue
+         name = str(item.get("name", "")).strip()
+         src = str(item.get("path", "")).strip()
+-        dst = str(item.get("destination", "")).strip()
+         if not name or not src:
+-            raise ValueError("كل مصدر يحتاج اسماً ومساراً صحيحين.")
+-        if name.casefold() in seen_names:
+-            raise ValueError(f"اسم المصدر مكرر: {name}")
+-        seen_names.add(name.casefold())
+-
+-        # في الواجهة الوجهة صريحة، وفي ملفات CLI القديمة تحسب من target_root.
+-        effective_dst = dst or str(cfg.get("target_root", "")).strip()
+-        if not effective_dst:
+-            raise ValueError(f"لم تُحدد وجهة للمصدر: {name}")
+-        try:
+-            src_abs = os.path.abspath(src)
+-            dst_abs = os.path.abspath(effective_dst)
+-            if os.path.commonpath((src_abs, dst_abs)) == src_abs:
+-                raise ValueError(
+-                    f"الوجهة للمصدر «{name}» تقع داخل مجلد المصدر. اختر وجهة خارج المصدر."
+-                )
+-        except ValueError as exc:
+-            # Windows يرفع ValueError أيضاً لمسارات أقراص مختلفة؛ هذا آمن.
+-            if "تقع داخل" in str(exc):
+-                raise
++            errors.append("كل مصدر يحتاج اسماً ومساراً صحيحين.")
++            continue
++        if name.casefold() in seen:
++            errors.append(f"اسم المصدر مكرر: {name}")
++        seen.add(name.casefold())
++        if not (str(item.get("destination") or "").strip() or default_root):
++            errors.append(f"لم تُحدد وجهة للمصدر: {name}")
++    if errors:
++        return errors
++
++    jobs = plan_jobs(cfg)
++    for i, a in enumerate(jobs):
++        if _overlaps(a["src"], a["dst"]):
++            errors.append(f"«{a['name']}»: المصدر والوجهة متداخلان (إحداهما داخل الأخرى):\n"
++                          f"     المصدر: {a['src']}\n     الوجهة: {a['dst']}")
++        for b in jobs[i + 1:]:
++            if _overlaps(a["dst"], b["dst"]):
++                errors.append(f"تداخل بين وجهتي «{a['name']}» و«{b['name']}» (ستختلط ملفاتهما):\n"
++                              f"     {a['dst']}\n     {b['dst']}")
++            if _overlaps(a["dst"], b["src"]):
++                errors.append(f"وجهة «{a['name']}» تتداخل مع مصدر «{b['name']}»:\n"
++                              f"     {a['dst']}\n     {b['src']}")
++            if _overlaps(b["dst"], a["src"]):
++                errors.append(f"وجهة «{b['name']}» تتداخل مع مصدر «{a['name']}»:\n"
++                              f"     {b['dst']}\n     {a['src']}")
++    return errors
++
++
++def validate_config(cfg: dict) -> None:
++    """يرفع ValueError برسالة تجمع كل الأخطاء لو الإعدادات غير سليمة."""
++    errors = collect_config_errors(cfg)
++    if errors:
++        raise ValueError("\n\n".join(errors))
+ 
+ 
+ # ----------------------------------------------------------------------------
+@@ -404,75 +560,79 @@ def validate_config(cfg: dict) -> None:
+ def run_backup(cfg: dict, logger: logging.Logger, dry_run: bool = False, progress_callback=None):
+     """
+     ينفذ عملية نسخ احتياطي كاملة حسب الإعدادات المعطاة.
+-    progress_callback(source_name: str, percent: int) اختياري - يُستدعى دورياً بنسبة
+-    الإنجاز الحالية (0-100) لكل مصدر أثناء نسخه.
++    progress_callback(source_name: str, percent: int, file_name: str = "") اختياري -
++    يُستدعى دورياً بنسبة الإنجاز (0-100) لكل مصدر أثناء نسخه، و -1 أثناء التحقق.
++    يمكن إيقافها بـ request_cancel().
+     يرجع tuple: (overall_ok: bool, summary_text: str, run_target_root: str)
++    يرفع ValueError لو الإعدادات غير سليمة (قبل أي كتابة على القرص).
+     """
+     validate_config(cfg)
++    CANCEL.clear()
+     logger.info("=" * 70)
+     logger.info("بدء عملية النسخ الاحتياطي")
+     logger.info("=" * 70)
+ 
+     start_time = datetime.now()
+     timestamp_folder = start_time.strftime("%Y-%m-%d_%H%M%S")
++    stamped = cfg.get("timestamped_backup", False)
+ 
+-    target_base = cfg["target_root"]
+-    run_target_root = (
+-        os.path.join(target_base, timestamp_folder)
+-        if cfg.get("timestamped_backup", False)
+-        else target_base
+-    )
++    target_base = str(cfg.get("target_root") or "").strip()
++    run_target_root = os.path.join(target_base, timestamp_folder) if (stamped and target_base) else target_base
+ 
++    jobs = plan_jobs(cfg, timestamp_folder)
+     results = {}
+-    used_folder_names = {}
+-
+-    for src_cfg in cfg["sources"]:
+-        name, src = src_cfg["name"], src_cfg["path"]
++    v_cfg = cfg.get("verification", {})
++    verify_enabled = v_cfg.get("compare_file_count_and_size", False) or v_cfg.get("checksum_verify_sources")
+ 
+-        # دعم مجلد الوجهة الخاص بكل مصدر (destination)
+-        # إذا حُدِّد destination صراحةً يُستخدم مباشرةً، وإلا يُحسب تلقائياً
+-        explicit_dst = src_cfg.get("destination", "").strip()
+-        if explicit_dst:
+-            dst = explicit_dst
+-        else:
+-            base_folder_name = os.path.basename(os.path.normpath(src)) or name
+-            count = used_folder_names.get(base_folder_name, 0)
+-            folder_name = base_folder_name if count == 0 else f"{base_folder_name}_{count + 1}"
+-            used_folder_names[base_folder_name] = count + 1
+-            dst = os.path.join(run_target_root, folder_name)
++    for job in jobs:
++        name, src, dst = job["name"], job["src"], job["dst"]
++        if CANCEL.is_set():
++            results[name] = None  # لم يبدأ
++            continue
++        logger.info(f"[{name}] {src}  ->  {dst}")
+ 
+         per_source_cb = (lambda pct, fname="", _name=name: progress_callback(_name, pct, fname)) if progress_callback else None
+         copy_ok = backup_source_with_retry(name, src, dst, cfg, logger, dry_run, per_source_cb)
+         verify_ok = True
+-        v_cfg = cfg.get("verification", {})
+-        if copy_ok and not dry_run and (v_cfg.get("compare_file_count_and_size", False) or v_cfg.get("checksum_verify_sources")):
++        if copy_ok and not dry_run and not CANCEL.is_set() and verify_enabled:
+             if progress_callback:
+                 progress_callback(name, -1, "تحقق")
+             verify_ok = verify_backup(name, src, dst, cfg, logger)
+ 
+         results[name] = (copy_ok, verify_ok)
+ 
++    cancelled = CANCEL.is_set()
++
+     # سياسة الاحتفاظ (فقط لو كل نسخة بمجلد بتاريخ)
+-    if cfg.get("timestamped_backup", False) and not dry_run:
++    if stamped and cfg.get("retention_enabled", False) and target_base and not dry_run and not cancelled:
+         apply_retention(target_base, cfg.get("retention_days", 30), logger)
+ 
+     # ملخص
+     duration = datetime.now() - start_time
+-    overall_ok = all(ok and vok for ok, vok in results.values())
++    overall_ok = (not cancelled) and all(r is not None and r[0] and r[1] for r in results.values())
+ 
+     summary_lines = [f"ملخص عملية النسخ الاحتياطي - {start_time:%Y-%m-%d %H:%M:%S}", ""]
+-    for name, (ok, vok) in results.items():
+-        status = "✔ نجاح" if ok and vok else "✘ فشل"
+-        summary_lines.append(f"  - {name}: {status}  (نسخ: {'ناجح' if ok else 'فاشل'}, تحقق: {'ناجح' if vok else 'فاشل'})")
++    for job in jobs:
++        name, r = job["name"], results[job["name"]]
++        if r is None:
++            summary_lines.append(f"  - {name}: ⏹ لم يبدأ (أُلغيت العملية)")
++        elif cancelled and not r[0]:
++            summary_lines.append(f"  - {name}: ⏹ أُلغي أثناء النسخ")
++        else:
++            ok, vok = r
++            status = "✔ نجاح" if ok and vok else "✘ فشل"
++            summary_lines.append(f"  - {name}: {status}  (نسخ: {'ناجح' if ok else 'فاشل'}, تحقق: {'ناجح' if vok else 'فاشل'})")
++        summary_lines.append(f"      {job['src']}  ->  {job['dst']}")
+     summary_lines.append("")
+     summary_lines.append(f"المدة الكلية: {duration}")
+-    summary_lines.append(f"الحالة العامة: {'نجاح كامل' if overall_ok else 'يوجد فشل - راجع اللوج'}")
++    state = "أُلغيت بطلب المستخدم" if cancelled else ("نجاح كامل" if overall_ok else "يوجد فشل - راجع اللوج")
++    summary_lines.append(f"الحالة العامة: {state}")
+     summary_text = "\n".join(summary_lines)
+ 
+     logger.info("\n" + summary_text)
+ 
+     e_cfg = cfg.get("email", {})
+-    if (overall_ok and e_cfg.get("send_on_success")) or (not overall_ok and e_cfg.get("send_on_failure")):
++    if not cancelled and ((overall_ok and e_cfg.get("send_on_success")) or (not overall_ok and e_cfg.get("send_on_failure"))):
+         subject = "[Backup Tool] نجاح النسخ الاحتياطي" if overall_ok else "[Backup Tool] فشل النسخ الاحتياطي - يتطلب مراجعة"
+         send_email(subject, summary_text, cfg, logger)
+ 
+@@ -489,7 +649,11 @@ def main():
+         cfg = yaml.safe_load(f)
+ 
+     logger = setup_logging(cfg["logging"]["log_dir"], cfg["logging"]["keep_log_days"])
+-    overall_ok, _, _ = run_backup(cfg, logger, args.dry_run)
++    try:
++        overall_ok, _, _ = run_backup(cfg, logger, args.dry_run)
++    except ValueError as e:
++        logger.error("إعدادات غير صالحة:\n%s", e)
++        sys.exit(2)
+     sys.exit(0 if overall_ok else 1)
+ 
+ 
+diff --git a/gui_backup_tool.py b/gui_backup_tool.py
+index 8cc698b..bc08f9f 100644
+--- a/gui_backup_tool.py
++++ b/gui_backup_tool.py
+@@ -435,18 +435,7 @@ def _decode_bytes(b: bytes) -> str:
+     return b.decode("utf-8", errors="replace")
+ 
+ 
+-def _get_subprocess_kwargs():
+-    """خيارات إخفاء أي شاشة سوداء للأوامر المنفذة في ويندوز تماماً"""
+-    kwargs = {}
+-    if sys.platform == "win32":
+-        kwargs["creationflags"] = (
+-            subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0x08000000
+-        )
+-        si = subprocess.STARTUPINFO()
+-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+-        si.wShowWindow = 0  # SW_HIDE
+-        kwargs["startupinfo"] = si
+-    return kwargs
++_get_subprocess_kwargs = core._get_subprocess_kwargs  # نفس دالة إخفاء النوافذ في backup_tool
+ 
+ 
+ def net_use_connect(ip, username, password, timeout=20):
+@@ -623,14 +612,18 @@ class ShareDiscoveryWorker(QThread):
+ 
+ 
+ class BackupWorker(QThread):
+-    progress   = pyqtSignal(str, int)
++    progress   = pyqtSignal(str, int)   # (اسم المصدر، النسبة الكلية 0-99)
+     status_msg = pyqtSignal(str)
+-    finished   = pyqtSignal(bool)
++    error_msg  = pyqtSignal(str)        # سبب الفشل/الرفض ليُعرض للمستخدم
++    done       = pyqtSignal(bool)       # (لا نسمّيها finished حتى لا نحجب إشارة QThread)
+ 
+     def __init__(self, cfg, parent=None):
+         super().__init__(parent)
+         self.cfg = cfg
+ 
++    def cancel(self):
++        core.request_cancel()
++
+     def run(self):
+         logger = logging.getLogger("backup_tool_gui")
+         logger.setLevel(logging.DEBUG)
+@@ -650,31 +643,41 @@ class BackupWorker(QThread):
+         except Exception:
+             pass
+ 
++        names = [s["name"] for s in self.cfg["sources"]]
++        total = max(1, len(names))
+         last_update = [0.0, -2]
+ 
+         def cb(name, pct, fname=""):
+-            # Robocopy قد يبلغ عن آلاف الملفات في الثانية. تقييد التحديثات هنا
+-            # يبقي الواجهة ناعمة بدون إبطاء النسخ الفعلي.
++            # التقدم الكلي = (المصادر المنتهية + نسبة الحالي) / عدد المصادر.
++            # تقييد التحديثات يبقي الواجهة ناعمة بدون إبطاء النسخ الفعلي.
++            idx = names.index(name) if name in names else 0
++            frac = 1.0 if pct == -1 else max(0, min(100, pct)) / 100
++            overall = min(99, int((idx + frac) / total * 100))
+             now = time.monotonic()
+-            should_emit = pct in (-1, 100) or (now - last_update[0] >= 0.15 and pct != last_update[1])
++            should_emit = pct in (-1, 100) or (now - last_update[0] >= 0.15 and overall != last_update[1])
+             if not should_emit:
+                 return
+-            last_update[:] = [now, pct]
+-            self.progress.emit(name, pct)
++            last_update[:] = [now, overall]
++            self.progress.emit(name, overall)
++            tag = f"({idx + 1}/{total})"
+             if pct == -1:
+-                self.status_msg.emit(f"⚙ جاري التحقق: {name}")
++                self.status_msg.emit(f"⚙ جاري التحقق {tag}: {name}")
+             elif fname:
+-                self.status_msg.emit(f"📋 نسخ: {name} → {fname}")
++                self.status_msg.emit(f"📋 نسخ {tag}: {name} → {fname}")
+             else:
+-                self.status_msg.emit(f"📋 نسخ: {name}  ({pct}%)")
++                self.status_msg.emit(f"📋 نسخ {tag}: {name}  ({pct}%)")
+ 
+         try:
+             ok, _, _ = core.run_backup(self.cfg, logger, False, cb)
+-            self.finished.emit(ok)
++            self.done.emit(ok)
++        except ValueError as e:               # إعدادات غير سليمة (تداخل مسارات...)
++            logger.error("إعدادات غير صالحة:\n%s", e)
++            self.error_msg.emit(str(e))
++            self.done.emit(False)
+         except Exception as e:
+-            self.status_msg.emit(f"خطأ: {e}")
+-            self.finished.emit(False)
+-
++            logger.exception("خطأ غير متوقع")
++            self.error_msg.emit(f"خطأ غير متوقع: {e}")
++            self.done.emit(False)
+ 
+ # ─────────────────────────────────────────────────────────────────────────────
+ # Modern Progress Bar
+@@ -758,7 +761,8 @@ class ResultCard(QFrame):
+ # Main Window
+ # ─────────────────────────────────────────────────────────────────────────────
+ DEFAULT_ROBOCOPY = {"retries": 3, "wait_seconds": 5, "threads": 8,
+-                    "mirror": False, "backup_mode": False}
++                    "mirror": False, "backup_mode": False,
++                    "overwrite_existing": False}   # الوضع الآمن: لا يُستبدل أي ملف بالوجهة
+ DEFAULT_JOB = {"job_retries": 3, "job_retry_wait_seconds": 60, "retention_days": 30}
+ 
+ COL_NAME = 0
+@@ -1133,6 +1137,11 @@ class BackupMainWindow(QMainWindow):
+                                     "font-size: 11pt; border-radius: 9px; padding: 0 16px;")
+         self.btn_run.clicked.connect(self._start_backup)
+         run_btn_row.addWidget(self.btn_run)
++        self.btn_cancel = ModernButton("إيقاف", "■", "ghost")
++        self.btn_cancel.setFixedSize(130, 42)
++        self.btn_cancel.setEnabled(False)
++        self.btn_cancel.clicked.connect(self._cancel_backup)
++        run_btn_row.addWidget(self.btn_cancel)
+         run_btn_row.addStretch()
+         run_lay.addLayout(run_btn_row)
+ 
+@@ -1179,6 +1188,8 @@ class BackupMainWindow(QMainWindow):
+     # Navigation
+     # ─────────────────────────────────────────────────────────────────────────
+     PAGE_TITLES = ["الاتصال بالسيرفر", "إدارة المسارات", "التشغيل والمتابعة"]
++    _cancel_requested = False
++    _last_error = ""
+ 
+     def _switch_page(self, idx: int):
+         for i, btn in enumerate(self._nav_btns):
+@@ -1301,6 +1312,12 @@ class BackupMainWindow(QMainWindow):
+             QMessageBox.warning(self, "تنبيه",
+                                 "أدخل الاسم + المصدر + الوجهة قبل الإضافة.")
+             return
++        try:  # امنع التداخل من لحظة الإضافة
++            core.validate_config({"sources": self._get_sources() +
++                                  [{"name": name, "path": src, "destination": dst}]})
++        except ValueError as ex:
++            QMessageBox.warning(self, "تداخل أو خطأ في المسارات", str(ex))
++            return
+         item = QTreeWidgetItem([name, src, dst])
+         item.setToolTip(COL_SRC, src)
+         item.setToolTip(COL_DST, dst)
+@@ -1333,7 +1350,7 @@ class BackupMainWindow(QMainWindow):
+             raise ValueError("أضف مصدراً واحداً على الأقل.")
+         return {
+             "sources": sources,
+-            "target_root": sources[0]["destination"],
++            "target_root": "",  # لكل صف وجهته الصريحة
+             "timestamped_backup": False,
+             "robocopy": DEFAULT_ROBOCOPY,
+             **DEFAULT_JOB,
+@@ -1364,10 +1381,13 @@ class BackupMainWindow(QMainWindow):
+         try:
+             cfg = yaml.safe_load(open(path, encoding="utf-8"))
+             self.src_tree.clear()
++            root = str(cfg.get("target_root") or "").strip()
+             for s in cfg.get("sources", []):
++                dst = s.get("destination") or ""
++                if not dst and root:  # ملف إعدادات قديم/CLI: وجهة = الجذر + اسم المجلد
++                    dst = os.path.join(root, os.path.basename(os.path.normpath(s.get("path", ""))) or s.get("name", ""))
+                 self.src_tree.addTopLevelItem(
+-                    QTreeWidgetItem([s.get("name",""), s.get("path",""),
+-                                     s.get("destination","")]))
++                    QTreeWidgetItem([s.get("name",""), s.get("path",""), dst]))
+             conn = cfg.get("connection", {})
+             if conn.get("ip"): self.entry_ip.setText(conn["ip"])
+             if conn.get("username"): self.entry_user.setText(conn["username"])
+@@ -1384,14 +1404,18 @@ class BackupMainWindow(QMainWindow):
+             return
+         try:
+             cfg = self._build_config()
++            core.validate_config(cfg)   # يمنع التداخل قبل أي كتابة على القرص
+         except ValueError as ex:
+-            QMessageBox.warning(self, "تنبيه", str(ex)); return
++            QMessageBox.critical(self, "لا يمكن بدء النسخ", str(ex)); return
+ 
++        self._cancel_requested = False
++        self._last_error = ""
+         self.result_card.clear()
+         self.progress_bar.setValue(0)
+         self.lbl_pct.setText("0%")
+         self.lbl_prog_src.setText("جاري البدء...")
+         self.btn_run.setEnabled(False)
++        self.btn_cancel.setEnabled(True)
+         self._run_start = time.time()
+         self._elapsed_timer.start()
+ 
+@@ -1402,9 +1426,25 @@ class BackupMainWindow(QMainWindow):
+         self.worker.progress.connect(self._on_progress)
+         self.worker.status_msg.connect(
+             lambda m: self.lbl_prog_src.setText(m))
+-        self.worker.finished.connect(self._on_finished)
++        self.worker.error_msg.connect(self._on_error)
++        self.worker.done.connect(self._on_finished)
+         self.worker.start()
+ 
++    def _cancel_backup(self):
++        if not (self.worker and self.worker.isRunning()):
++            return
++        if QMessageBox.question(
++                self, "إيقاف النسخ",
++                "إيقاف النسخ الجاري الآن؟\nالملفات التي نُسخت بالفعل تبقى في الوجهة، "
++                "ويمكنك إعادة التشغيل لاحقاً لإكمال الباقي.",
++                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
++            return
++        self._cancel_requested = True
++        self.btn_cancel.setEnabled(False)
++        self.lbl_prog_src.setText("⏹ جاري الإيقاف...")
++        self.worker.cancel()
++
+     def _tick_elapsed(self):
+         e = int(time.time() - self._run_start)
+         mm, ss = divmod(e, 60)
+@@ -1419,10 +1459,19 @@ class BackupMainWindow(QMainWindow):
+         else:
+             self.lbl_prog_src.setText(f"⚙ تحقق من: {name}")
+ 
++    def _on_error(self, msg: str):
++        self._last_error = msg
++
+     def _on_finished(self, ok: bool):
+         self._elapsed_timer.stop()
+         self._time_badge.setText("")
+         self.btn_run.setEnabled(True)
++        self.btn_cancel.setEnabled(False)
++        if self._cancel_requested:
++            self.lbl_prog_src.setText("⏹ أُلغيت العملية بطلبك")
++            self.lbl_pct.setText(f"{self.progress_bar.value()}%")
++            self.result_card.clear()
++            return
+         self.progress_bar.setValue(100 if ok else self.progress_bar.value())
+         self.lbl_pct.setText("100%" if ok else f"{self.progress_bar.value()}%")
+         self.lbl_prog_src.setText("اكتملت العملية" if ok else "انتهت بفشل")
+@@ -1430,17 +1479,28 @@ class BackupMainWindow(QMainWindow):
+             self.result_card.show_ok()
+         else:
+             self.result_card.show_fail()
++            if self._last_error:   # أظهر السبب بدل ضياعه خلف عبارة "انتهت بفشل"
++                QMessageBox.critical(self, "فشلت العملية", self._last_error)
++                self._last_error = ""
+ 
+     def closeEvent(self, event):
+-        """لا تسمح بإغلاق Qt بينما خيط النسخ ما زال يكتب على القرص."""
++        """أثناء النسخ: اسأل المستخدم، وعند الموافقة أوقف النسخ بأمان ثم أغلق."""
+         if self.worker and self.worker.isRunning():
+-            QMessageBox.warning(
+-                self, "نسخ جارٍ", "لا يمكن إغلاق التطبيق أثناء النسخ الاحتياطي. انتظر حتى تظهر النتيجة.")
+-            event.ignore()
+-            return
++            if QMessageBox.question(
++                    self, "نسخ جارٍ",
++                    "يوجد نسخ جارٍ. إيقافه والخروج الآن؟",
++                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
++                event.ignore()
++                return
++            self._cancel_requested = True
++            self.worker.cancel()
++            if not self.worker.wait(20000):
++                event.ignore()
++                QMessageBox.warning(self, "تنبيه", "لم يتوقف النسخ بعد، حاول الإغلاق بعد قليل.")
++                return
+         super().closeEvent(event)
+ 
+-
+ # ─────────────────────────────────────────────────────────────────────────────
+ # Entry point
+ # ─────────────────────────────────────────────────────────────────────────────
+diff --git a/build.bat b/build.bat
+index 3fd08f7..259684b 100644
+--- a/build.bat
++++ b/build.bat
+@@ -22,7 +22,6 @@ py -3.12 -m PyInstaller ^
+     --hidden-import "PyQt6.QtCore" ^
+     --hidden-import "PyQt6.QtGui" ^
+     --hidden-import "PyQt6.QtWidgets" ^
+-    --collect-all "PyQt6" ^
+     --exclude-module "tkinter" ^
+     --exclude-module "matplotlib" ^
+     --exclude-module "numpy" ^
+@@ -31,6 +30,14 @@ py -3.12 -m PyInstaller ^
+     --exclude-module "PIL" ^
+     --exclude-module "PySide6" ^
+     --exclude-module "PySide2" ^
++    --exclude-module "PyQt6.QtWebEngineCore" ^
++    --exclude-module "PyQt6.QtWebEngineWidgets" ^
++    --exclude-module "PyQt6.QtQuick" ^
++    --exclude-module "PyQt6.QtQml" ^
++    --exclude-module "PyQt6.QtMultimedia" ^
++    --exclude-module "PyQt6.QtPdf" ^
++    --exclude-module "PyQt6.QtDesigner" ^
++    --exclude-module "PyQt6.QtBluetooth" ^
+     --exclude-module "PyQt5" ^
+     gui_backup_tool.py
+ 
+diff --git a/BackupTool.spec b/BackupTool.spec
+index 8b3928c..bd26c77 100644
+--- a/BackupTool.spec
++++ b/BackupTool.spec
+@@ -1,11 +1,7 @@
+ # -*- mode: python ; coding: utf-8 -*-
+-from PyInstaller.utils.hooks import collect_all
+-
+ datas = [('icon.png', '.')]
+ binaries = []
+ hiddenimports = ['backup_tool', 'yaml', 'PyQt6.sip', 'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets']
+-tmp_ret = collect_all('PyQt6')
+-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+ 
+ 
+ a = Analysis(
+@@ -17,7 +13,9 @@ a = Analysis(
+     hookspath=[],
+     hooksconfig={},
+     runtime_hooks=[],
+-    excludes=['tkinter', 'matplotlib', 'numpy', 'pandas', 'scipy', 'PIL', 'PySide6', 'PySide2', 'PyQt5'],
++    excludes=['tkinter', 'matplotlib', 'numpy', 'pandas', 'scipy', 'PIL', 'PySide6', 'PySide2', 'PyQt5',
++              'PyQt6.QtWebEngineCore', 'PyQt6.QtWebEngineWidgets', 'PyQt6.QtQuick', 'PyQt6.QtQml',
++              'PyQt6.QtMultimedia', 'PyQt6.QtPdf', 'PyQt6.QtDesigner', 'PyQt6.QtBluetooth'],
+     noarchive=False,
+     optimize=0,
+ )
+diff --git a/README.md b/README.md
+index 3549062..1c44ae7 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,12 @@
+    * نسخ الملفات الجديدة والمعدلة فقط، مع تجاوز الملفات المتطابقة مسبقاً لتوفير الوقت واستهلاك الشبكة.
+    * إمكانية العمل بنظام التراكم اليومي طوال الشهر؛ حيث تُضاف الملفات الجديدة في كل تشغيل دون حذف أي ملفات سابقة في مجلد الوجهة.
+ 
+-2. **أمان وحماية تامة لملفات المصدر:**
++2. **وضع آمن افتراضي (لا حذف ولا استبدال):**
++   * المصدر للقراءة فقط: لا `/MOVE` ولا `/PURGE`، وأعلام الحذف/النقل ممنوعة برمجيًا (`/MOV /MOVE /PURGE /MIR`) ويرفضها البرنامج قبل التنفيذ.
++   * الوجهة لا يُحذف منها شيء: خيار `mirror` ممنوع، والحذف التلقائي للنسخ القديمة (`retention`) معطّل إلا بـ `retention_enabled: true` صراحةً.
++   * لا يُستبدل أي ملف موجود في الوجهة (`/XC /XN /XO`): يُنسخ الجديد فقط، وأي ملف موجود بنسخة مختلفة يُسجَّل تحذيرًا ويبقى كما هو. للسماح بالاستبدال: `overwrite_existing: true`.
++
++   (سابقًا:) **أمان وحماية تامة لملفات المصدر:**
+    * عملية القراءة من المصدر آمنة 100% (`Read-Only`) دون أي مساس أو تعديل أو نقل أو حذف لبيانات المصدر الحساسة.
+ 
+ 3. **تخصيص مجلد وجهة مستقل لكل مصدر:**
+@@ -22,10 +27,18 @@
+    * شريط تقدم يوضح اسم الملف الجاري نسخه في الوقت الفعلي مع بطاقة نتيجة خضراء/حمراء واضحة.
+    * تصميم متجاوب يدعم تصغير وتكبير النافذة وملء الشاشة بحرية دون تشوه المحتويات.
+ 
+-5. **فحص ومطابقة سلامة البيانات (Verification):**
++5. **منع تداخل المصادر والوجهات:**
++   * قبل أي نسخ يفحص البرنامج: وجهتان متطابقتان أو إحداهما داخل الأخرى، وجهة داخل مصدرها أو داخل مصدر آخر، أسماء مكررة. عند أي تداخل لا يكتب شيئًا ويعرض السبب.
++   * الفحص يتم أيضًا لحظة إضافة الصف في الجدول. (لا يكتشف أن `E:` مربوط بنفس مشاركة الشبكة `\\srv\share` — استخدم مسارات متسقة.)
++
++6. **تقدم حقيقي وإيقاف آمن:**
++   * النسبة محسوبة بالبايت المنسوخ فعليًا من حجم المصدر، وشريط واحد يمثل التقدم الكلي لكل المصادر.
++   * زر **إيقاف** يوقف robocopy فورًا ولا يبدأ المصادر التالية؛ الملفات المنسوخة تبقى ويمكن إكمال الباقي لاحقًا.
++
++7. **فحص ومطابقة سلامة البيانات (Verification):**
+    * فحص ذكي يتأكد من وصول كافة ملفات المصدر إلى الوجهة وتطابق أحجامها بالكامل، دون اعتبار وجود ملفات إضافية بالهدف كخطأ.
+ 
+-6. **دعم السيرفرات ومشاركات الشبكة:**
++8. **دعم السيرفرات ومشاركات الشبكة:**
+    * مصادقة واتصال مباشر بالسيرفر عبر بروتوكول SMB/IPC$ مع إمكانية استعراض المشاركات العادية والإدارية المخفية (`C$`, `D$`).
+ 
+ ---
+@@ -61,7 +74,7 @@ python gui_backup_tool.py
+ build.bat
+ ```
+ سيتم إنشاء الملف في المجلد:
+-`dist\BackupTool.exe`
++`dist\BackupTool\BackupTool.exe` (مجلد كامل، لأن البناء `--onedir`)
+ 
+ ### 3. إنشاء ملف التثبيت (Setup Wizard):
+ افتح الملف [`BackupTool.iss`](BackupTool.iss) باستخدام برنامج **Inno Setup Compiler** واضغط على **Compile**.
+@@ -72,3 +85,10 @@ build.bat
+ 
+ ## 👨‍💻 المطور
+ * **تطوير:** Mohammed Eydan
++
++---
++
++## ⚙️ ملاحظات للمطور
++* `.gitignore` يستثني `build/` و`dist/` و`__pycache__/`. لو كانت متتبَّعة سابقًا: `git rm -r -q --cached build dist __pycache__`.
++* كلمة مرور SMTP (للـ CLI): يمكن تمريرها بمتغير البيئة `BACKUP_SMTP_PASSWORD` بدل كتابتها في `config.yaml`.
++* ملفات الإعدادات: لكل مصدر `destination` صريحة؛ أو `target_root` (قديم/CLI) فيُنشأ مجلد باسم المصدر داخله.
+diff --git a/config.sample.yaml b/config.sample.yaml
+index a394f22..366e392 100644
+--- a/config.sample.yaml
++++ b/config.sample.yaml
+@@ -1,19 +1,27 @@
+ # مثال إعدادات (نفس الصيغة التي تحفظها الواجهة وتقرأها أداة CLI)
+ sources:
++  # لكل مصدر وجهته الصريحة (destination) - يُمنع تداخل الوجهات أو داخل المصادر
+   - name: Documents
+     path: D:\Documents
++    destination: \\server\backup\Documents
+   - name: JadeDB
+     path: D:\Jade\DB
+-target_root: \\server\backup
++    destination: E:\Backups\JadeDB
++  # بدون destination: يُستخدم target_root + مجلد باسم المصدر
++  - name: Photos
++    path: D:\Photos
++target_root: \\server\backup\Default
+ timestamped_backup: true
+ robocopy:
+   retries: 5
+   wait_seconds: 15
+   threads: 4
+-  mirror: false
++  mirror: false              # ممنوع تفعيله (يحذف من الوجهة) - يرفضه البرنامج
++  overwrite_existing: false  # false = لا يُستبدل أي ملف موجود بالوجهة، يُنسخ الجديد فقط
+   backup_mode: false
+ job_retries: 3
+ job_retry_wait_seconds: 60
++retention_enabled: false   # لا حذف تلقائي أبداً إلا لو فُعّل صراحةً (مع timestamped_backup)
+ retention_days: 30
+ verification:
+   compare_file_count_and_size: true
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..71aeb1e
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,9 @@
++# ملفات البناء والتشغيل
++build/
++dist/
++Output/
++__pycache__/
++*.pyc
++*.log
++# إعدادات محلية قد تحوي كلمات مرور
++config.yaml

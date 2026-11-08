@@ -22,7 +22,6 @@ py -3.12 -m PyInstaller ^
     --hidden-import "PyQt6.QtCore" ^
     --hidden-import "PyQt6.QtGui" ^
     --hidden-import "PyQt6.QtWidgets" ^
-    --collect-all "PyQt6" ^
     --exclude-module "tkinter" ^
     --exclude-module "matplotlib" ^
     --exclude-module "numpy" ^
@@ -31,6 +30,14 @@ py -3.12 -m PyInstaller ^
     --exclude-module "PIL" ^
     --exclude-module "PySide6" ^
     --exclude-module "PySide2" ^
+    --exclude-module "PyQt6.QtWebEngineCore" ^
+    --exclude-module "PyQt6.QtWebEngineWidgets" ^
+    --exclude-module "PyQt6.QtQuick" ^
+    --exclude-module "PyQt6.QtQml" ^
+    --exclude-module "PyQt6.QtMultimedia" ^
+    --exclude-module "PyQt6.QtPdf" ^
+    --exclude-module "PyQt6.QtDesigner" ^
+    --exclude-module "PyQt6.QtBluetooth" ^
     --exclude-module "PyQt5" ^
     gui_backup_tool.py
 

@@ -1,0 +1,9 @@
+# ملفات البناء والتشغيل
+build/
+dist/
+Output/
+__pycache__/
+*.pyc
+*.log
+# إعدادات محلية قد تحوي كلمات مرور
+config.yaml
