@@ -1,0 +1,33 @@
+# مثال إعدادات (نفس الصيغة التي تحفظها الواجهة وتقرأها أداة CLI)
+sources:
+  - name: Documents
+    path: D:\Documents
+  - name: JadeDB
+    path: D:\Jade\DB
+target_root: \\server\backup
+timestamped_backup: true
+robocopy:
+  retries: 5
+  wait_seconds: 15
+  threads: 4
+  mirror: false
+  backup_mode: false
+job_retries: 3
+job_retry_wait_seconds: 60
+retention_days: 30
+verification:
+  compare_file_count_and_size: true
+  checksum_verify_sources: [JadeDB]
+logging:
+  log_dir: C:\BackupTool\logs
+  keep_log_days: 60
+email:
+  enabled: false
+  smtp_server: smtp.example.com
+  smtp_port: 587
+  username: user@example.com
+  password: ""
+  from_addr: user@example.com
+  to_addrs: [admin@example.com]
+  send_on_success: false
+  send_on_failure: true

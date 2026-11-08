@@ -1,0 +1,3 @@
+pyyaml
+PyQt6
+pyinstaller
